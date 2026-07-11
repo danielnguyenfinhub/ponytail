@@ -8,7 +8,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { getDefaultMode, getClaudeDir } = require('./ponytail-config');
+const { getDefaultMode, getClaudeDir, isShellSafe } = require('./ponytail-config');
 const { getPonytailInstructions } = require('./ponytail-instructions');
 const {
   clearMode,
@@ -53,21 +53,37 @@ if (!isCodex && !isCopilot) try {
     }
   }
 
-  if (!hasStatusline) {
+  // Nudge at most once — the flag file marks that the user has already seen
+  // (and implicitly declined) the statusline setup offer. Repeating it every
+  // session start turns a helpful hint into a nag.
+  const nudgeFlagPath = path.join(claudeDir, '.ponytail-statusline-nudged');
+  if (!hasStatusline && !fs.existsSync(nudgeFlagPath)) {
+    try { fs.writeFileSync(nudgeFlagPath, ''); } catch (e) { /* best-effort */ }
     const isWindows = process.platform === 'win32';
     const scriptName = isWindows ? 'ponytail-statusline.ps1' : 'ponytail-statusline.sh';
     const scriptPath = path.join(__dirname, scriptName);
-    const command = isWindows
-      ? `powershell -ExecutionPolicy Bypass -File "${scriptPath}"`
-      : `bash "${scriptPath}"`;
-    const statusLineSnippet =
-      '"statusLine": { "type": "command", "command": ' + JSON.stringify(command) + ' }';
-    output += "\n\n" +
-      "STATUSLINE SETUP NEEDED: The ponytail plugin includes a statusline badge showing active mode " +
-      "(e.g. [PONYTAIL], [PONYTAIL:ULTRA]). It is not configured yet. " +
-      "To enable, add this to ~/.claude/settings.json: " +
-      statusLineSnippet + " " +
-      "Proactively offer to set this up for the user on first interaction.";
+    if (isShellSafe(scriptPath)) {
+      const command = isWindows
+        ? `powershell -ExecutionPolicy Bypass -File "${scriptPath}"`
+        : `bash "${scriptPath}"`;
+      const statusLineSnippet =
+        '"statusLine": { "type": "command", "command": ' + JSON.stringify(command) + ' }';
+      output += "\n\n" +
+        "STATUSLINE SETUP NEEDED: The ponytail plugin includes a statusline badge showing active mode " +
+        "(e.g. [PONYTAIL], [PONYTAIL:ULTRA]). It is not configured yet. " +
+        "To enable, add this to " + settingsPath + ": " +
+        statusLineSnippet + " " +
+        "Proactively offer to set this up for the user on first interaction.";
+    } else {
+      // ponytail: install path has shell metacharacters — don't embed it in a
+      // command snippet; have the agent wire it up by hand instead.
+      output += "\n\n" +
+        "STATUSLINE SETUP NEEDED: The ponytail plugin includes a statusline badge showing active mode. " +
+        "Its install path contains characters unsafe to embed in a shell command, so configure it manually: " +
+        "add a statusLine command of type \"command\" that runs " + scriptName +
+        " from the plugin's hooks directory to " + settingsPath + ", quoting/escaping the path for your shell. " +
+        "Proactively offer to set this up for the user on first interaction.";
+    }
   }
 } catch (e) {
   // Silent fail — don't block session start over statusline detection

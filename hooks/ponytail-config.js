@@ -42,6 +42,15 @@ function isDeactivationCommand(text) {
   return t === 'stop ponytail' || t === 'normal mode';
 }
 
+// ponytail: only embed the plugin install path in a statusline shell command when
+// it's made of ordinary path characters. An allowlist beats escaping every shell's
+// metacharacters; a hostile clone path (quotes, &, $, backtick, ;, etc.) falls back
+// to manual setup instead. Allows : \ / for normal Windows and POSIX paths. Full
+// per-shell escaper only if a real need appears.
+function isShellSafe(p) {
+  return typeof p === 'string' && /^[A-Za-z0-9 _.\-:/\\~]+$/.test(p);
+}
+
 function getConfigDir() {
   if (process.env.XDG_CONFIG_HOME) {
     return path.join(process.env.XDG_CONFIG_HOME, 'ponytail');
@@ -67,15 +76,19 @@ function getClaudeDir() {
 function getDefaultMode() {
   // 1. Environment variable (highest priority)
   const envMode = process.env.PONYTAIL_DEFAULT_MODE;
-  if (envMode && VALID_MODES.includes(envMode.toLowerCase())) {
+  // ponytail: a default must be a runtime level (off/lite/full/ultra); review is
+  // a session-only mode, never a valid default (#377). Validate against
+  // RUNTIME_MODES so a stray env var or config can't make review the default.
+  if (envMode && RUNTIME_MODES.includes(envMode.toLowerCase())) {
     return envMode.toLowerCase();
   }
 
   // 2. Config file
   try {
     const configPath = getConfigPath();
-    const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-    if (config.defaultMode && VALID_MODES.includes(config.defaultMode.toLowerCase())) {
+    // Strip UTF-8 BOM (common on Windows-saved files) so JSON.parse doesn't choke
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf8').replace(/^\uFEFF/, ''));
+    if (config.defaultMode && RUNTIME_MODES.includes(config.defaultMode.toLowerCase())) {
       return config.defaultMode.toLowerCase();
     }
   } catch (e) {
@@ -86,13 +99,54 @@ function getDefaultMode() {
   return DEFAULT_MODE;
 }
 
+// Silence the pi "Ponytail loaded" startup toast while keeping ponytail active.
+// PONYTAIL_QUIET_STARTUP=1 (or any truthy value; 0/false/empty mean "show it")
+// takes precedence, else config.quietStartup === true. Mirrors getHideStatus.
+function getQuietStartup() {
+  const env = process.env.PONYTAIL_QUIET_STARTUP;
+  if (env !== undefined) {
+    const v = env.trim().toLowerCase();
+    return v !== '' && v !== '0' && v !== 'false' && v !== 'no';
+  }
+  try {
+    const config = JSON.parse(fs.readFileSync(getConfigPath(), 'utf8').replace(/^\uFEFF/, ''));
+    return config.quietStartup === true;
+  } catch (_) {
+    return false;
+  }
+}
+
+// Hide the status-bar indicator while keeping ponytail active (#324).
+// PONYTAIL_HIDE_STATUS=1 (or any truthy value; 0/false/empty mean "don't hide")
+// takes precedence, else config.hideStatus === true.
+function getHideStatus() {
+  const env = process.env.PONYTAIL_HIDE_STATUS;
+  if (env !== undefined) {
+    const v = env.trim().toLowerCase();
+    return v !== '' && v !== '0' && v !== 'false' && v !== 'no';
+  }
+  try {
+    const config = JSON.parse(fs.readFileSync(getConfigPath(), 'utf8').replace(/^\uFEFF/, ''));
+    return config.hideStatus === true;
+  } catch (_) {
+    return false;
+  }
+}
+
 function writeDefaultMode(mode) {
-  const normalized = normalizeConfigMode(mode);
+  // ponytail: only a runtime level can be a default; review is session-only (#377).
+  const normalized = normalizeMode(mode);
   if (!normalized) return null;
 
   const configPath = getConfigPath();
   fs.mkdirSync(path.dirname(configPath), { recursive: true });
-  fs.writeFileSync(configPath, JSON.stringify({ defaultMode: normalized }, null, 2), 'utf8');
+  let config = {};
+  try {
+    config = JSON.parse(fs.readFileSync(configPath, 'utf8').replace(/^\uFEFF/, ''));
+    if (!config || typeof config !== 'object' || Array.isArray(config)) config = {};
+  } catch (_) {}
+  config.defaultMode = normalized;
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
   return normalized;
 }
 
@@ -104,6 +158,9 @@ module.exports = {
   getConfigDir,
   getConfigPath,
   getClaudeDir,
+  getHideStatus,
+  getQuietStartup,
+  isShellSafe,
   normalizeMode,
   normalizeConfigMode,
   normalizePersistedMode,

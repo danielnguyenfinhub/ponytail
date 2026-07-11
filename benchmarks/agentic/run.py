@@ -22,7 +22,7 @@ over-engineering score is a later pass.
 ponytail: the claude CLI is the harness (already installed, we run inside it). No SDK
 dependency. The CLI's JSON output already carries cost/tokens/duration/permission_denials.
 """
-import argparse, concurrent.futures, datetime, json, os, re, shutil, statistics, subprocess, sys, tempfile
+import argparse, concurrent.futures, datetime, json, os, re, shutil, signal, statistics, subprocess, sys, tempfile
 from collections import defaultdict
 from pathlib import Path
 
@@ -89,11 +89,40 @@ def _count(p: Path, with_comments: bool):
         n += 1
     return n
 
-def code_stats(workdir: Path):
+_SELFCHECK_DEFS = ("def demo(", "def _demo(", "def selfcheck(", "def _selfcheck(",
+                   "def _check(", "def _smoke(", "def smoke(")
+def _selfcheck_split(p: Path):
+    """Split a produced .py file at the first TOP-LEVEL self-check marker (a `__main__` guard or a
+    demo()/selfcheck() function) through end of file. Returns (src_total, src_code, sc_total,
+    sc_code), counted like _count. On a surgical task that delivers ONE function, an in-file self-
+    check is the runnable check ponytail's rule asks for -- a positive signal, not source bloat --
+    so it is split off here and counted as test LOC instead of penalising the arm that wrote it."""
+    try: lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception: return 0, 0, 0, 0
+    start = None
+    for i, ln in enumerate(lines):
+        if ln[:1] not in (" ", "\t") and (ln.startswith("if __name__") or ln.startswith(_SELFCHECK_DEFS)):
+            start = i; break
+    def cnt(seq):
+        t = c = 0
+        for ln in seq:
+            s = ln.strip()
+            if not s: continue
+            t += 1
+            if not s.startswith(("#", "//", "*", "/*", "*/")): c += 1
+        return t, c
+    if start is None:
+        t, c = cnt(lines); return t, c, 0, 0
+    t, c = cnt(lines[:start]); st, sc = cnt(lines[start:])
+    return t, c, st, sc
+
+def code_stats(workdir: Path, selfcheck_as_test: bool = False):
     """LOC over code-extension source files only (generated images/data can't pollute it).
     total_loc counts every non-blank line including comments and docstrings -- the bloat a vibe
     baseline actually produces. src_loc is code-only, for the breakdown. Tests tracked separately,
-    never as bloat."""
+    never as bloat. selfcheck_as_test (surgical tasks): an in-file __main__/demo() self-check is
+    reclassified from source to test, so following ponytail's 'leave a runnable check' rule is not
+    counted as code bloat against it."""
     fixture = set()                                   # files that were seeded, not delivered
     fm = workdir / "_fixture_files.json"
     if fm.exists():
@@ -105,10 +134,19 @@ def code_stats(workdir: Path):
              and not p.name.startswith((".", "_")) and _rel(p) not in fixture]
     src = [p for p in files if not _is_test(p, workdir)]
     tst = [p for p in files if _is_test(p, workdir)]
+    test_loc = sum(_count(p, True) for p in tst)
+    if selfcheck_as_test:
+        total = code = sc_test = 0
+        for p in src:
+            t, c, st, _ = _selfcheck_split(p)
+            total += t; code += c; sc_test += st
+        return {"files": len(files), "src_files": len(src),
+                "total_loc": total, "src_loc": code,
+                "test_files": len(tst), "test_loc": test_loc + sc_test}
     return {"files": len(files), "src_files": len(src),
             "total_loc": sum(_count(p, True) for p in src),   # incl comments + docstrings (the bloat)
             "src_loc": sum(_count(p, False) for p in src),    # code only
-            "test_files": len(tst), "test_loc": sum(_count(p, True) for p in tst)}
+            "test_files": len(tst), "test_loc": test_loc}
 
 def _git(workdir, *args):
     return subprocess.run([shutil.which("git") or "git", *args], cwd=str(workdir),
@@ -151,13 +189,16 @@ def selftest():
         axis = task.get("axis", "safe")
         for kind in ("good", "bad"):
             with tempfile.TemporaryDirectory() as d:
-                (Path(d) / task["file"]).write_text(task[kind], encoding="utf-8")
+                for fn, content in task.get("seed", {}).items():   # seed siblings (a helper module
+                    (Path(d) / fn).write_text(content, encoding="utf-8")  # the ref imports) too
+                (Path(d) / task["file"]).write_text(task[kind], encoding="utf-8")  # entry = the ref
                 r = task["score"](Path(d))
             ok = (r["correct"] == 1 and r["safe"] == 1) if kind == "good" else (r[axis] == 0)
             print(f"{'ok ' if ok else 'XX '} {tid:12} {kind:4} correct={r['correct']} "
                   f"safe={r['safe']} axis={axis}  {r['reason']}")
             failures += 0 if ok else 1
     failures += _selftest_plugin_dir()
+    failures += _selftest_kill()
     print(f"\nselftest: {'all instruments valid' if not failures else str(failures) + ' BROKEN'}")
     return failures
 
@@ -180,6 +221,27 @@ def _selftest_plugin_dir():
         ok_miss = True
     print(f"{'ok ' if ok_miss else 'XX '} plugin_dir   miss clear error (sys.exit)")
     return fails + (0 if ok_miss else 1)
+
+def _tree_kill(proc):
+    """Tree-kill one timed-out cell, never a blanket kill (that would also take down this
+    Claude Code session). Windows: taskkill /T walks the child PIDs. POSIX has no taskkill,
+    so the cell runs in its own session (Popen start_new_session) and we kill the group."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        try: os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError: pass  # already exited
+
+def _selftest_kill():
+    """tree-kill must actually terminate a cell that outran its timeout, on this platform."""
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                         start_new_session=(os.name != "nt"))
+    _tree_kill(p)
+    try: ok = p.wait(timeout=10) is not None
+    except subprocess.TimeoutExpired: ok = False; p.kill()
+    print(f"{'ok ' if ok else 'XX '} tree_kill    terminates a timed-out cell")
+    return 0 if ok else 1
 
 def chat_code_loc(text):
     """LOC of fenced code blocks in a chat answer: (total incl comments, code-only)."""
@@ -205,7 +267,8 @@ def score_workspace(task_id, arm, model, workdir: Path):
                     "cache_tokens": (u.get("cache_read_input_tokens") or 0) + (u.get("cache_creation_input_tokens") or 0)}
             result_text = j.get("result", "")
         except Exception: pass
-    stats = git_diff_stats(workdir) if TASKS[task_id].get("fixture") else code_stats(workdir)
+    surgical = not TASKS[task_id].get("open") and not TASKS[task_id].get("fixture")
+    stats = git_diff_stats(workdir) if TASKS[task_id].get("fixture") else code_stats(workdir, selfcheck_as_test=surgical)
     # open/explain tasks answer in the chat, not a file. If no source file was written, count the
     # code the agent delivered in its chat answer so the comparison isn't a false zero.
     if TASKS[task_id].get("open") and stats["total_loc"] == 0 and result_text:
@@ -258,16 +321,16 @@ def run_cell(task_id, arm, model, workdir: Path):
     out_path, err_path = workdir / "_claude.json", workdir / "_claude.stderr.txt"
     # stdout -> file, never a PIPE: on Windows a hung agent's child processes can hold a stdout PIPE
     # open forever, so subprocess.run(timeout=) never fires and the worker freezes. Writing to a file
-    # lets proc.wait(timeout) return reliably; on timeout we tree-kill ONLY this cell's process
-    # (taskkill /T on proc.pid) -- never a blanket kill, which would also take down this Claude Code session.
+    # lets proc.wait(timeout) return reliably; on timeout _tree_kill ends ONLY this cell's process
+    # tree -- never a blanket kill, which would also take down this Claude Code session.
     try:
         with open(out_path, "wb") as so, open(err_path, "wb") as se:
-            proc = subprocess.Popen(cmd, cwd=str(workdir), stdout=so, stderr=se)
+            proc = subprocess.Popen(cmd, cwd=str(workdir), stdout=so, stderr=se,
+                                    start_new_session=(os.name != "nt"))
             try:
                 proc.wait(timeout=CELL_TIMEOUT)
             except subprocess.TimeoutExpired:
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                _tree_kill(proc)
                 try: proc.wait(timeout=15)
                 except Exception: pass
                 se.write(f"\n[KILLED after {CELL_TIMEOUT}s timeout]".encode())

@@ -1,11 +1,13 @@
 // ponytail — OpenCode plugin.
 //
 // Injects the ponytail ruleset into every chat's system prompt at the active
-// intensity, and persists /ponytail mode switches. Reuses the shared instruction
-// builder so Claude Code, Codex, pi, and OpenCode all read one source of truth.
+// intensity, persists /ponytail mode switches, and registers slash commands so
+// they work when the package is installed from npm. Reuses the shared
+// instruction builder so Claude Code, Codex, pi, and OpenCode all read one
+// source of truth.
 //
 // OpenCode loads this as a server plugin — add it to your opencode.json:
-//   { "plugin": ["./.opencode/plugins/ponytail.mjs"] }
+//   { "plugin": ["@dietrichgebert/ponytail"] }
 
 import { createRequire } from 'module';
 import fs from 'fs';
@@ -19,6 +21,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const { getPonytailInstructions } = require('../../hooks/ponytail-instructions');
 const { getDefaultMode, normalizePersistedMode } = require('../../hooks/ponytail-config');
+const { parseCommandFile } = require('./ponytail-frontmatter.cjs');
 
 // OpenCode has no flag-file convention of its own; keep mode beside its config.
 const statePath = path.join(
@@ -48,8 +51,18 @@ export default async ({ client } = {}) => {
   const ponytailSkillsDir = path.resolve(__dirname, '../../skills');
 
   return {
-    // Register skills directory so opencode discovers ponytail skills.
+    // Register slash commands + skills directory.
     config: async (config) => {
+      if (!config.command) config.command = {};
+      const commandDir = path.join(__dirname, '..', 'command');
+      try {
+        for (const file of fs.readdirSync(commandDir).filter((f) => f.endsWith('.md'))) {
+          const name = path.basename(file, '.md');
+          const parsed = parseCommandFile(path.join(commandDir, file));
+          if (parsed) config.command[name] = parsed;
+        }
+      } catch (e) {}
+
       config.skills = config.skills || {};
       config.skills.paths = config.skills.paths || [];
       if (!config.skills.paths.includes(ponytailSkillsDir)) {
@@ -61,7 +74,12 @@ export default async ({ client } = {}) => {
     'experimental.chat.system.transform': async (_input, output) => {
       const mode = readMode();
       if (mode === 'off') return;
-      output.system.push(getPonytailInstructions(mode));
+      const instructions = getPonytailInstructions(mode);
+      if (output.system.length > 0) {
+        output.system[output.system.length - 1] += '\n\n' + instructions;
+      } else {
+        output.system.push(instructions);
+      }
     },
 
     // Persist `/ponytail <level>` so the next turn's injection follows it.
@@ -71,7 +89,9 @@ export default async ({ client } = {}) => {
     'command.execute.before': async (input) => {
       if (!input || input.command !== 'ponytail') return;
       // `off` is persisted like any mode; the transform reads it and stays silent.
-      const mode = normalizePersistedMode((input.arguments || '').trim()) || getDefaultMode();
+      const args = String(input.arguments || '').trim();
+      const mode = args ? normalizePersistedMode(args) : getDefaultMode();
+      if (!mode) return;
       writeMode(mode);
       log('info', 'ponytail ' + mode);
     },
