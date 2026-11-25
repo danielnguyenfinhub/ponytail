@@ -27,10 +27,35 @@ fs.mkdirSync(claudeDir, { recursive: true });
 const flagPath = path.join(claudeDir, '.ponytail-active');
 fs.writeFileSync(flagPath, 'full');
 
+// Qoder keeps its flag in ~/.qoder (hooks/ponytail-runtime.js), and since
+// #676 it holds "off", so a leftover would start a reinstall switched off.
+const qoderFlagPath = path.join(home, '.qoder', '.ponytail-active');
+fs.mkdirSync(path.dirname(qoderFlagPath), { recursive: true });
+fs.writeFileSync(qoderFlagPath, 'ultra');
+const qoderCustomDir = path.join(temp, 'qoder-custom-config');
+const qoderCustomFlagPath = path.join(qoderCustomDir, '.ponytail-active');
+fs.mkdirSync(qoderCustomDir, { recursive: true });
+fs.writeFileSync(qoderCustomFlagPath, 'lite');
+
+// OpenCode keeps its flag beside its own config; a leftover "off" would start a
+// reinstall switched off.
+const opencodeFlagPath = path.join(temp, 'config-home', 'opencode', '.ponytail-active');
+fs.mkdirSync(path.dirname(opencodeFlagPath), { recursive: true });
+fs.writeFileSync(opencodeFlagPath, 'off');
+
+const nudgeFlagPath = path.join(claudeDir, '.ponytail-statusline-nudged');
+fs.writeFileSync(nudgeFlagPath, '');
+
 const configDir = path.join(temp, 'config-home', 'ponytail');
 fs.mkdirSync(configDir, { recursive: true });
 const configPath = path.join(configDir, 'config.json');
 fs.writeFileSync(configPath, JSON.stringify({ defaultMode: 'ultra' }));
+
+// #1032: the statusline script copy kept in the config dir.
+const statuslineCopyPath = path.join(claudeDir, 'ponytail-statusline.sh');
+fs.writeFileSync(statuslineCopyPath, '#!/usr/bin/env bash\n');
+const statuslinePs1CopyPath = path.join(claudeDir, 'ponytail-statusline.ps1');
+fs.writeFileSync(statuslinePs1CopyPath, '');
 
 const settingsPath = path.join(claudeDir, 'settings.json');
 fs.writeFileSync(settingsPath, JSON.stringify({
@@ -64,8 +89,14 @@ const env = {
 let result = runUninstall(env);
 assert.equal(result.status, 0, result.stderr);
 assert.equal(fs.existsSync(flagPath), false, 'mode flag must be removed');
+assert.equal(fs.existsSync(qoderFlagPath), false, 'Qoder mode flag must be removed');
+assert.equal(fs.existsSync(opencodeFlagPath), false, 'OpenCode mode flag must be removed');
+assert.equal(fs.existsSync(qoderCustomFlagPath), true, 'default Qoder uninstall must not touch a separate custom config');
+assert.equal(fs.existsSync(nudgeFlagPath), false, 'statusline nudge flag must be removed');
 assert.equal(fs.existsSync(configPath), false, 'config file must be removed');
 assert.equal(fs.existsSync(cursorFlagPath), false, 'Cursor mode flag must be removed');
+assert.equal(fs.existsSync(statuslineCopyPath), false, 'statusline script copy must be removed (#1032)');
+assert.equal(fs.existsSync(statuslinePs1CopyPath), false, 'statusline .ps1 copy must be removed (#1032)');
 assert.deepEqual(
   JSON.parse(fs.readFileSync(cursorHooksPath, 'utf8')),
   { version: 1, hooks: { sessionStart: [{ command: './hooks/mine.sh' }] } },
@@ -93,6 +124,20 @@ assert.equal(
   "a user's own statusLine must not be touched",
 );
 
+// A user command that merely contains ponytail's script name must also survive.
+fs.writeFileSync(settingsPath, JSON.stringify({
+  statusLine: { type: 'command', command: 'bash ~/my-ponytail-statusline.sh' },
+}));
+
+result = runUninstall(env);
+assert.equal(result.status, 0, result.stderr);
+const settingsAfterSimilarName = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+assert.equal(
+  settingsAfterSimilarName.statusLine.command,
+  'bash ~/my-ponytail-statusline.sh',
+  "a similarly named user statusLine must not be touched",
+);
+
 // #374: a combined statusline (another plugin && ponytail) must keep the other
 // plugin's part — uninstall must not nuke the whole command or leave a husk.
 fs.writeFileSync(settingsPath, JSON.stringify({
@@ -107,6 +152,10 @@ assert.equal(
   'bash ~/caveman-statusline.sh',
   'a combined statusLine must keep the non-ponytail command',
 );
+
+result = runUninstall({ ...env, QODER_CONFIG_DIR: qoderCustomDir });
+assert.equal(result.status, 0, result.stderr);
+assert.equal(fs.existsSync(qoderCustomFlagPath), false, 'Qoder custom config mode flag must be removed');
 
 // #434: a malformed settings.json must not crash the script mid-cleanup. It
 // can't be safely edited, so uninstall warns and leaves the file byte-for-byte
